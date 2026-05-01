@@ -1,0 +1,602 @@
+"""
+UITestron 完整版 - 多 Agent 协作 + 长链推理
+核心特性：
+1. 4 个专用 Agent 协作（Planner, Executor, Inspector, Reporter）
+2. 长链推理：设计稿 → 策略 → 执行 → 对比 → 归因 → 报告
+3. 支持 Web/iOS/Android 跨平台
+4. 失败自动创建 Jira + 归因分析
+"""
+
+import json
+import time
+import base64
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, field
+from enum import Enum
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
+from openai import OpenAI
+from PIL import Image
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+# ============ 配置 ============
+OPENAI_API_KEY = "your_openai_key"
+FIGMA_ACCESS_TOKEN = "your_figma_token"
+JIRA_URL = "https://your-domain.atlassian.net"
+JIRA_EMAIL = "your_email"
+JIRA_TOKEN = "your_jira_token"
+
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+# ============ 数据类型定义 ============
+class Platform(Enum):
+    WEB = "web"
+    IOS = "ios"
+    ANDROID = "android"
+
+
+class TestStatus(Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    PASSED = "passed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+@dataclass
+class UIElement:
+    """UI 元素"""
+    id: str
+    name: str
+    type: str  # button, input, text, image, etc.
+    bounds: Dict[str, float]  # x, y, width, height
+    text: Optional[str] = None
+    selector: Optional[str] = None  # CSS selector or XPath
+
+
+@dataclass
+class TestCase:
+    """测试用例"""
+    id: str
+    name: str
+    action: str  # click, input, scroll, wait
+    target_element: UIElement
+    expected_result: str
+    platform_specific: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TestPlan:
+    """测试计划（由 Planner Agent 生成）"""
+    design_file: str
+    total_cases: int
+    cases: List[TestCase]
+    platforms: List[Platform]
+    estimated_tokens: int
+
+
+@dataclass
+class TestResult:
+    """测试结果"""
+    test_case_id: str
+    platform: Platform
+    status: TestStatus
+    screenshot_path: Optional[str] = None
+    error_message: Optional[str] = None
+    visual_diff: Optional[str] = None  # 视觉对比差异描述
+    root_cause: Optional[str] = None   # 根因分析
+    duration_ms: int = 0
+    tokens_used: int = 0
+
+
+# ============ Agent 1: Planner Agent（长链推理入口）============
+class PlannerAgent:
+    """
+    规划 Agent：解析设计稿，生成测试计划
+    核心能力：长链推理 - 从视觉元素推导测试策略
+    """
+    
+    def __init__(self, figma_file_key: str):
+        self.figma_file_key = figma_file_key
+        self.figma_data = None
+    
+    def fetch_figma_design(self) -> Dict:
+        """获取 Figma 设计数据"""
+        url = f"https://api.figma.com/v1/files/{self.figma_file_key}"
+        resp = requests.get(url, headers={"X-Figma-Token": FIGMA_ACCESS_TOKEN})
+        resp.raise_for_status()
+        self.figma_data = resp.json()
+        return self.figma_data
+    
+    def extract_elements(self, node: Dict, elements: List = None) -> List[UIElement]:
+        """递归提取 UI 元素（长链推理的第一步：结构化解析）"""
+        if elements is None:
+            elements = []
+        
+        node_type = node.get("type", "")
+        # 识别可交互元素
+        interactive_types = ["FRAME", "COMPONENT", "INSTANCE", "TEXT", "RECTANGLE"]
+        
+        if node_type in interactive_types:
+            element = UIElement(
+                id=node.get("id"),
+                name=node.get("name", "unnamed"),
+                type=node_type.lower(),
+                bounds=node.get("absoluteBoundingBox", {}),
+                text=node.get("characters", None)
+            )
+            elements.append(element)
+        
+        for child in node.get("children", []):
+            self.extract_elements(child, elements)
+        
+        return elements
+    
+    def generate_test_cases(self, elements: List[UIElement]) -> List[TestCase]:
+        """
+        长链推理核心：根据元素类型自动生成测试用例
+        推理链：识别元素类型 → 确定交互动作 → 预期结果推导
+        """
+        test_cases = []
+        
+        for idx, elem in enumerate(elements):
+            # 推理逻辑：根据元素名称/类型推断测试动作
+            elem_name_lower = elem.name.lower()
+            
+            if "button" in elem_name_lower or elem.type == "component":
+                action = "click"
+                expected = f"按钮 {elem.name} 应触发相应交互（跳转/弹窗/状态变化）"
+            elif "input" in elem_name_lower or "textfield" in elem_name_lower:
+                action = "input"
+                expected = f"输入框 {elem.name} 应能正常输入文本"
+            elif "checkbox" in elem_name_lower or "radio" in elem_name_lower:
+                action = "click"
+                expected = f"选择器 {elem.name} 应能正常切换选中状态"
+            elif "link" in elem_name_lower:
+                action = "click"
+                expected = f"链接 {elem.name} 应跳转到正确页面"
+            else:
+                continue  # 非交互元素跳过
+            
+            test_case = TestCase(
+                id=f"TC_{idx:03d}",
+                name=f"测试 {elem.name}",
+                action=action,
+                target_element=elem,
+                expected_result=expected
+            )
+            test_cases.append(test_case)
+        
+        return test_cases
+    
+    def create_test_plan(self) -> TestPlan:
+        """完整的长链推理：设计稿 → 元素解析 → 测试用例生成 → 测试计划"""
+        print("[Planner] 开始长链推理...")
+        
+        # 步骤1: 获取设计稿
+        print("[Planner] 1/4 获取 Figma 设计稿...")
+        self.fetch_figma_design()
+        
+        # 步骤2: 提取元素
+        print("[Planner] 2/4 提取 UI 元素...")
+        elements = self.extract_elements(self.figma_data["document"])
+        print(f"        提取到 {len(elements)} 个 UI 元素")
+        
+        # 步骤3: 生成测试用例
+        print("[Planner] 3/4 生成测试用例（推理交互逻辑）...")
+        test_cases = self.generate_test_cases(elements)
+        print(f"        生成 {len(test_cases)} 个测试用例")
+        
+        # 步骤4: 估算 Token 消耗
+        estimated_tokens = len(test_cases) * 500  # 每个用例约 500 token
+        print(f"[Planner] 4/4 估算 Token 消耗: {estimated_tokens}")
+        
+        plan = TestPlan(
+            design_file=self.figma_file_key,
+            total_cases=len(test_cases),
+            cases=test_cases,
+            platforms=[Platform.WEB, Platform.IOS, Platform.ANDROID],
+            estimated_tokens=estimated_tokens
+        )
+        
+        print("[Planner] ✅ 长链推理完成，测试计划已生成")
+        return plan
+
+
+# ============ Agent 2: Executor Agent（跨平台执行）============
+class ExecutorAgent:
+    """
+    执行 Agent：在目标平台上执行具体操作
+    支持：Web(Selenium)、iOS/Android(Appium 占位)
+    """
+    
+    def __init__(self, platform: Platform):
+        self.platform = platform
+        self.driver = None
+    
+    def _setup_web_driver(self):
+        """启动 Web 驱动"""
+        options = webdriver.ChromeOptions()
+        options.add_argument("--headless")
+        options.add_argument("--no-sandbox")
+        self.driver = webdriver.Chrome(options=options)
+    
+    def _setup_mobile_driver(self):
+        """启动移动端驱动（需要 Appium Server）"""
+        # 实际使用时需要配置 Appium
+        print(f"[Executor] {self.platform.value} 驱动需要 Appium 服务")
+        # 此处为占位，生产环境需完整实现
+    
+    def start(self):
+        """启动对应平台的驱动"""
+        if self.platform == Platform.WEB:
+            self._setup_web_driver()
+        else:
+            self._setup_mobile_driver()
+    
+    def navigate(self, url: str):
+        if self.platform == Platform.WEB and self.driver:
+            self.driver.get(url)
+    
+    def execute_action(self, test_case: TestCase) -> bool:
+        """
+        执行单个测试动作
+        返回：是否执行成功（不包含视觉验证）
+        """
+        try:
+            elem = test_case.target_element
+            if self.platform == Platform.WEB:
+                # 尝试多种定位策略
+                selectors = [
+                    (By.ID, elem.id),
+                    (By.CSS_SELECTOR, f"[data-testid='{elem.name}']"),
+                    (By.XPATH, f"//*[text()='{elem.text}']") if elem.text else None,
+                    (By.CLASS_NAME, elem.type)
+                ]
+                
+                web_element = None
+                for by, value in selectors:
+                    if value:
+                        try:
+                            web_element = WebDriverWait(self.driver, 5).until(
+                                EC.presence_of_element_located((by, value))
+                            )
+                            break
+                        except:
+                            continue
+                
+                if not web_element:
+                    raise Exception(f"无法定位元素: {elem.name}")
+                
+                if test_case.action == "click":
+                    web_element.click()
+                elif test_case.action == "input":
+                    web_element.send_keys("test_input")
+                elif test_case.action == "scroll":
+                    self.driver.execute_script("arguments[0].scrollIntoView();", web_element)
+                
+                return True
+                
+        except Exception as e:
+            print(f"[Executor] 执行失败: {e}")
+            return False
+    
+    def screenshot(self, path: str):
+        if self.platform == Platform.WEB and self.driver:
+            self.driver.save_screenshot(path)
+    
+    def quit(self):
+        if self.driver:
+            self.driver.quit()
+
+
+# ============ Agent 3: Inspector Agent（多模态视觉对比 + 归因）============
+class InspectorAgent:
+    """
+    检查 Agent：多模态大模型进行视觉对比
+    核心能力：差异识别 + 根因分析（长链推理的归因环节）
+    """
+    
+    def __init__(self):
+        self.client = openai_client
+    
+    def encode_image(self, image_path: str) -> str:
+        with open(image_path, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+    
+    def compare_with_reasoning(self, screenshot_path: str, design_image_path: str) -> Dict:
+        """
+        长链推理：视觉对比 → 差异识别 → 根因分析 → 严重程度评估
+        """
+        screenshot_b64 = self.encode_image(screenshot_path)
+        design_b64 = self.encode_image(design_image_path)
+        
+        # 复杂的推理 Prompt，引导模型进行多步分析
+        response = self.client.chat.completions.create(
+            model="gpt-4-turbo",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """你是一个 UI 测试专家。请执行以下推理链：
+                    1. 逐区域对比两张图片（设计稿 vs 实际截图）
+                    2. 识别所有差异点（布局偏移、颜色偏差、字体、间距、缺失元素）
+                    3. 对每个差异进行根因分析（可能是 CSS 问题、数据缺失、渲染引擎差异）
+                    4. 评估严重程度（critical / major / minor）
+                    5. 给出修复建议
+                    
+                    输出 JSON 格式：
+                    {
+                        "is_consistent": false,
+                        "differences": [{"type": "layout", "description": "...", "root_cause": "...", "severity": "major"}],
+                        "summary": "总结",
+                        "fix_suggestions": ["建议1"]
+                    }
+                    """
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{design_b64}"}
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}
+                        }
+                    ]
+                }
+            ],
+            max_tokens=1000,
+            response_format={"type": "json_object"}
+        )
+        
+        result = json.loads(response.choices[0].message.content)
+        result["tokens_used"] = response.usage.total_tokens
+        
+        # 长链推理的额外步骤：根据差异推断测试是否通过
+        is_passed = result.get("is_consistent", False)
+        if not is_passed:
+            # 如果有 critical 级别的差异，则失败
+            critical_exists = any(
+                diff.get("severity") == "critical" 
+                for diff in result.get("differences", [])
+            )
+            is_passed = not critical_exists
+        
+        result["final_decision"] = "pass" if is_passed else "fail"
+        
+        return result
+
+
+# ============ Agent 4: Reporter Agent（结果汇总 + Jira 创建）============
+class ReporterAgent:
+    """
+    报告 Agent：汇总所有测试结果，失败时创建 Jira Issue
+    """
+    
+    def __init__(self, jira_config: Dict):
+        self.jira_url = jira_config["url"]
+        self.auth = (jira_config["email"], jira_config["token"])
+    
+    def aggregate_results(self, results: List[TestResult]) -> Dict:
+        """汇总统计"""
+        total = len(results)
+        passed = sum(1 for r in results if r.status == TestStatus.PASSED)
+        failed = sum(1 for r in results if r.status == TestStatus.FAILED)
+        
+        return {
+            "total": total,
+            "passed": passed,
+            "failed": failed,
+            "pass_rate": passed / total if total > 0 else 0,
+            "total_tokens": sum(r.tokens_used for r in results),
+            "total_duration_ms": sum(r.duration_ms for r in results),
+            "failures_by_platform": {
+                p.value: sum(1 for r in results if r.platform == p and r.status == TestStatus.FAILED)
+                for p in Platform
+            }
+        }
+    
+    def create_jira_issue(self, result: TestResult) -> str:
+        """为失败的测试创建 Jira Issue，包含归因分析"""
+        description = f"""
+h2. UI 测试失败报告
+
+*测试用例:* {result.test_case_id}
+*平台:* {result.platform.value}
+*状态:* 失败
+
+h3. 错误信息
+{result.error_message}
+
+h3. 视觉差异分析
+{result.visual_diff}
+
+h3. 根因分析（AI 归因）
+{result.root_cause}
+
+h3. 截图
+!{result.screenshot_path}!
+
+h3. 建议操作
+1. 检查渲染逻辑与设计稿一致性
+2. 验证 CSS 样式是否正确加载
+3. 运行回归测试套件
+"""
+        
+        payload = {
+            "fields": {
+                "project": {"key": "UITEST"},
+                "summary": f"[UITestron] UI 测试失败 - {result.test_case_id} - {result.platform.value}",
+                "description": description,
+                "issuetype": {"name": "Bug"},
+                "priority": {"name": "High"}
+            }
+        }
+        
+        response = requests.post(
+            f"{self.jira_url}/rest/api/2/issue",
+            json=payload,
+            auth=self.auth,
+            headers={"Content-Type": "application/json"}
+        )
+        
+        if response.status_code == 201:
+            return response.json()["key"]
+        else:
+            raise Exception(f"Jira 创建失败: {response.text}")
+
+
+# ============ 主 Agent：UITestron Orchestrator（编排长链 + 多 Agent）============
+class UITestronOrchestrator:
+    """
+    主控 Agent：编排整个长链推理流程，协调多个 Agent
+    长链流程：
+    Planner → Executor（并行跨平台）→ Inspector → Reporter
+    """
+    
+    def __init__(self, figma_file_key: str, test_url: str):
+        self.figma_file_key = figma_file_key
+        self.test_url = test_url
+        self.planner = PlannerAgent(figma_file_key)
+        self.inspector = InspectorAgent()
+        self.reporter = ReporterAgent({
+            "url": JIRA_URL,
+            "email": JIRA_EMAIL,
+            "token": JIRA_TOKEN
+        })
+        self.test_plan = None
+        self.results: List[TestResult] = []
+    
+    def run(self):
+        """执行完整的长链推理 + 多 Agent 协作"""
+        print("\n" + "="*60)
+        print("🚀 UITestron Orchestrator 启动")
+        print("="*60)
+        
+        # === 长链推理环节 1: Planner（测试规划）===
+        print("\n[Phase 1/4] Planner Agent - 长链推理")
+        print("-" * 40)
+        self.test_plan = self.planner.create_test_plan()
+        
+        # === 长链推理环节 2: Executor（跨平台执行）===
+        print("\n[Phase 2/4] Executor Agent - 跨平台执行")
+        print("-" * 40)
+        self._execute_across_platforms()
+        
+        # === 长链推理环节 3: Inspector（视觉验证 + 归因）===
+        print("\n[Phase 3/4] Inspector Agent - 多模态对比与根因分析")
+        print("-" * 40)
+        self._inspect_all_results()
+        
+        # === 长链推理环节 4: Reporter（汇总 + Jira）===
+        print("\n[Phase 4/4] Reporter Agent - 结果汇总与问题上报")
+        print("-" * 40)
+        summary = self.reporter.aggregate_results(self.results)
+        
+        # 输出最终报告
+        print("\n" + "="*60)
+        print("📊 最终测试报告")
+        print("="*60)
+        print(f"总用例数: {summary['total']}")
+        print(f"✅ 通过: {summary['passed']}")
+        print(f"❌ 失败: {summary['failed']}")
+        print(f"📈 通过率: {summary['pass_rate']*100:.1f}%")
+        print(f"💰 总 Token 消耗: {summary['total_tokens']}")
+        print(f"⏱️  总耗时: {summary['total_duration_ms']}ms")
+        
+        # 失败用例自动创建 Jira
+        failed_results = [r for r in self.results if r.status == TestStatus.FAILED]
+        if failed_results:
+            print(f"\n📎 为 {len(failed_results)} 个失败用例创建 Jira Issue...")
+            for fr in failed_results:
+                try:
+                    issue_key = self.reporter.create_jira_issue(fr)
+                    print(f"   ✅ {fr.test_case_id} → Jira {issue_key}")
+                except Exception as e:
+                    print(f"   ❌ {fr.test_case_id} → 创建失败: {e}")
+        
+        return summary
+    
+    def _execute_across_platforms(self):
+        """并行执行多平台测试"""
+        def run_on_platform(platform: Platform):
+            results = []
+            executor = ExecutorAgent(platform)
+            try:
+                executor.start()
+                executor.navigate(self.test_url)
+                
+                for test_case in self.test_plan.cases[:5]:  # 限制数量便于演示
+                    start = time.time()
+                    status = TestStatus.PASSED
+                    error = None
+                    
+                    success = executor.execute_action(test_case)
+                    if not success:
+                        status = TestStatus.FAILED
+                        error = f"执行动作 {test_case.action} 失败"
+                    
+                    # 截图
+                    screenshot_path = f"/tmp/{test_case.id}_{platform.value}.png"
+                    executor.screenshot(screenshot_path)
+                    
+                    result = TestResult(
+                        test_case_id=test_case.id,
+                        platform=platform,
+                        status=status,
+                        screenshot_path=screenshot_path,
+                        error_message=error,
+                        duration_ms=int((time.time() - start) * 1000)
+                    )
+                    results.append(result)
+            finally:
+                executor.quit()
+            return results
+        
+        # 并行执行
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                executor.submit(run_on_platform, platform): platform 
+                for platform in self.test_plan.platforms
+            }
+            for future in as_completed(futures):
+                self.results.extend(future.result())
+    
+    def _inspect_all_results(self):
+        """对每个结果进行视觉对比 + 归因分析"""
+        for result in self.results:
+            if result.screenshot_path:
+                # 实际使用时，设计稿图片需要提前准备
+                # 这里模拟一个调用
+                design_mock_path = "/tmp/design_mock.png"
+                
+                inspection = self.inspector.compare_with_reasoning(
+                    result.screenshot_path,
+                    design_mock_path
+                )
+                
+                result.tokens_used = inspection.get("tokens_used", 0)
+                result.visual_diff = json.dumps(inspection.get("differences", []))
+                result.root_cause = inspection.get("summary", "")
+                
+                # 更新最终状态
+                if inspection.get("final_decision") == "fail":
+                    result.status = TestStatus.FAILED
+                    if not result.error_message:
+                        result.error_message = "视觉对比不一致"
+
+
+# ============ 运行入口 ============
+if __name__ == "__main__":
+    orchestrator = UITestronOrchestrator(
+        figma_file_key="YOUR_FIGMA_KEY",
+        test_url="https://your-test-app.com"
+    )
+    orchestrator.run()
